@@ -1,0 +1,19 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+path: "/home/wangfeng/RM2026/amor_data/python_refactor/dataset" # dataset root dir (absolute or relative; if relative, it's relative to default datasets_dir)
+train: train/images # train images (relative to 'path') 4 images
+val: val/images # val images (relative to 'path') 4 images
+test: # test images (optional)
+
+# Keypoints
+kpt_shape: [4, 2] # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+# flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+
+# Classes dictionary
+names:
+    0: guard
+    1: soldier
+    2: engineer
+    3: infantry_3
+    4: infantry_4
+    5: outpost
+    6: negative
