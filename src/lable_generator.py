@@ -375,105 +375,140 @@ class NumberClassifier:
         class_id = np.argmax(softmax_prob)
         confidence = softmax_prob[0, class_id]
         return class_id, confidence
-        
 
-def create_labels_for_image(img_dir, output_image_path, output_label_path):
-    """
-    label格式：class_id x1 y1 x2 y2 x3 y3 x4 y4
-    """
-    with open(output_label_path, 'w') as label_file:
-        for img_name in os.listdir(img_dir):
-            if not img_name.lower().endswith(('.png', '.jpg', '.bmp')):
-                continue
-            
-            img_path = os.path.join(img_dir, img_name)
-            image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            
-            detector = TraditionalArmorDetector(binary_thresh=100)
-            classifier = NumberClassifier(model_path, label_path)
+import cv2
+import numpy as np
+from pathlib import Path
+from tqdm import tqdm
 
-            binary_img, armors, lights = detector.detect(image)
-                
-            roi_images, armor_infos = extract_number_rois(image, armors)
-
-            classified_armors = []
-            for roi_img, armor_info in zip(roi_images, armor_infos):
-                class_id, confidence = classifier.classify_single(roi_img)
-                if confidence >= classifier.threshold:
-                    classified_armors.append((armor_info, class_id, confidence))
-
-            # 写入标签文件
-            label_line = []
-            for classified_armor in classified_armors:
-                armor_info, class_id, confidence = classified_armor
-                light_1 = armor_info['light_1']
-                light_2 = armor_info['light_2']
-
-                keypoints = [
-                    light_1.top,
-                    light_1.bottom,
-                    light_2.top,
-                    light_2.bottom
-                ]
-
-                label_line.append(f"{class_id} " + " ".join([f"{int(x)} {int(y)}" for (x, y) in keypoints]))
-            
-            if label_line:
-                label_file.write("\n".join(label_line) + "\n")
-
-
-if __name__ == "__main__":
-    model_path = "/home/wangfeng/RM2026/amor_data/python_refactor/model/cnn.onnx"
-    label_path = "/home/wangfeng/RM2026/amor_data/python_refactor/model/label.txt"
-    image_path = "/home/wangfeng/RM2026/amor_data/competation/5-25/3/images_0525_1513/0525_151322_9128_4.bmp"
-
-    detector = TraditionalArmorDetector(binary_thresh=100)
-    classifier = NumberClassifier(model_path, label_path)
-
-    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    
+def get_one_image_label(image, detector, classifier):
     height, width = image.shape
-    print(f"图像尺寸: {width} x {height}")
 
-
-    # 检测装甲板
     binary_img, armors, lights = detector.detect(image)
-    print(f"\n检测到 {len(armors)} 个装甲板")
         
     roi_images, armor_infos = extract_number_rois(image, armors)
-    print(f"提取到 {len(roi_images)} 个数字ROI")
 
     classified_armors = []
     for roi_img, armor_info in zip(roi_images, armor_infos):
         class_id, confidence = classifier.classify_single(roi_img)
         if confidence >= classifier.threshold:
             classified_armors.append((armor_info, class_id, confidence))
-            print(f"分类结果: 类别 {classifier.class_names[class_id]}, 置信度 {confidence:.2f}")
-        else:
-            print(f"分类结果: 置信度 {confidence:.2f} 低于阈值，忽略该装甲板")
-
-    # 左边12点 右边34点
-    classified_keypoints = []
     
+    classified_data = []
     for classified_armor in classified_armors:
         armor_info, class_id, confidence = classified_armor
         light_1 = armor_info['light_1']
         light_2 = armor_info['light_2']
 
+        # 计算归一化坐标 (0.0 ~ 1.0)
+        # 注意：这里保持原图的宽高进行归一化，这样直接 resize 图片后坐标依然有效
+        l1_top_norm = (light_1.top[0] / width, light_1.top[1] / height)
+        l1_bot_norm = (light_1.bottom[0] / width, light_1.bottom[1] / height)
+        l2_top_norm = (light_2.top[0] / width, light_2.top[1] / height)
+        l2_bot_norm = (light_2.bottom[0] / width, light_2.bottom[1] / height)
+
+        # 关键点列表
         keypoints = [
-            light_1.top,
-            light_1.bottom,
-            light_2.top,
-            light_2.bottom
+            l1_top_norm,
+            l1_bot_norm,
+            l2_bot_norm,
+            l2_top_norm,  # 注意检查这里的顺序是否符合你定义的逻辑（左上、左下、右下、右上）
         ]
 
-        classified_keypoints.append({
-            'keypoints': keypoints,
+        # 计算 Bounding Box
+        x_center = (light_1.center[0] + light_2.center[0]) / 2 / width
+        y_center = (light_1.center[1] + light_2.center[1]) / 2 / height
+        # 适当扩大 bbox 范围，确保包含整个装甲板
+        bbox_width = abs(light_2.center[0] - light_1.center[0]) * 1.5 / width 
+        bbox_height = (light_1.length + light_2.length) / 2 * 2.0 / height
+        
+        # 简单的越界处理 (防止 bbox 超出 0-1)
+        x_center = max(0, min(1, x_center))
+        y_center = max(0, min(1, y_center))
+        bbox_width = max(0, min(1, bbox_width))
+        bbox_height = max(0, min(1, bbox_height))
+
+        classified_data.append({
             'class_id': class_id,
-            'confidence': confidence
+            'bbox': (x_center, y_center, bbox_width, bbox_height),
+            'keypoints': keypoints
         })
 
-    print(classified_keypoints)
+    return classified_data
 
+def create_dataset(image_dir, output_label_dir, output_image_dir, detector, classifier):
+    """
+    处理图像：转3通道 -> Resize -> 保存
+    生成标签：检测 -> 归一化 -> 保存 txt
+    """
+    image_dir = Path(image_dir)
+    output_label_dir = Path(output_label_dir)
+    output_image_dir = Path(output_image_dir)
+    
+    # 确保输出目录存在
+    output_label_dir.mkdir(parents=True, exist_ok=True)
+    output_image_dir.mkdir(parents=True, exist_ok=True)
+
+    # 支持多种图片格式
+    image_files = list(image_dir.glob("*.bmp")) + list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png"))
+
+    for image_file in tqdm(image_files, desc="Processing Dataset"):
+        image_gray = cv2.imread(str(image_file), cv2.IMREAD_GRAYSCALE)
+        if image_gray is None: continue
+
+        classified_data = get_one_image_label(image_gray, detector, classifier)
+
+        # -------------------------------------------------
+        # 核心修改：先过滤数据，把 class_id == 6 的剔除
+        # -------------------------------------------------
+        valid_data = [item for item in classified_data if item['class_id'] != 6]
+
+        # 3. 图像处理：转 3 通道 + Resize (始终执行，因为负样本图也是极好的训练素材)
+        image_3c = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
+        image_resized = cv2.resize(image_3c, (640, 640))
+        save_img_path = output_image_dir / (image_file.stem + ".jpg")
+        cv2.imwrite(str(save_img_path), image_resized)
+
+        # 4. 保存标签文件
+        # 即使 valid_data 为空（说明全是负样本），我们也建议创建一个空的 txt 文件
+        # 这样 YOLO 知道这张图是故意留空的，而不是数据丢失
+        label_file_path = output_label_dir / (image_file.stem + ".txt")
         
-        
+        label_lines = []
+        if valid_data:
+            for item in valid_data:
+                class_id = item['class_id']
+                bbox = item['bbox']
+                keypoints = item['keypoints']
+
+                line_parts = [
+                    str(class_id),
+                    f"{bbox[0]:.6f}", f"{bbox[1]:.6f}", f"{bbox[2]:.6f}", f"{bbox[3]:.6f}"
+                ]
+                for kp in keypoints:
+                    line_parts.append(f"{kp[0]:.6f}")
+                    line_parts.append(f"{kp[1]:.6f}")
+                    line_parts.append("2") # 可见性
+                
+                label_lines.append(" ".join(line_parts))
+
+        # 写入文件 (如果是空列表，就创建一个空文件)
+        with open(label_file_path, 'w') as f:
+            f.write("\n".join(label_lines))
+
+
+if __name__ == "__main__":
+    model_path = "/home/wangfeng/RM2026/amor_data/python_refactor/model/cnn.onnx"
+    label_path = "/home/wangfeng/RM2026/amor_data/python_refactor/model/label.txt"
+    raw_image_dir = "/home/wangfeng/RM2026/amor_data/competation/5-24/3/images_0524_1608/"
+
+    detector = TraditionalArmorDetector(binary_thresh=100)
+    classifier = NumberClassifier(model_path, label_path)
+
+    create_dataset(
+        image_dir=raw_image_dir,
+        output_label_dir="/home/wangfeng/RM2026/amor_data/python_refactor/dataset/train/labels",
+        output_image_dir="/home/wangfeng/RM2026/amor_data/python_refactor/dataset/train/images",
+        detector=detector,
+        classifier=classifier
+    )
