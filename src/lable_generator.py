@@ -47,8 +47,8 @@ class Light:
 
 class LightParams:
     """灯条筛选参数(参考C++代码)"""
-    min_ratio = 0.1      # 最小宽长比
-    max_ratio = 0.4      # 最大宽长比(从0.55降低到0.4,更严格)
+    min_ratio = 0.01      # 最小宽长比
+    max_ratio = 0.6      # 最大宽长比(从0.55降低到0.4,更严格)
     max_angle = 45       # 最大倾斜角度
     min_length = 10      # 最小长度(增加到10)
     min_width = 2        # 最小宽度
@@ -167,26 +167,26 @@ class TraditionalArmorDetector:
         if point_distance_top <= 16 or point_distance_bottom <= 16:
             return False
         
-        # 6. 装甲板尺寸限制
-        all_points = np.array([light_1.top, light_1.bottom, light_2.top, light_2.bottom])
-        armor_width = np.max(all_points[:, 0]) - np.min(all_points[:, 0])
-        armor_height = np.max(all_points[:, 1]) - np.min(all_points[:, 1])
+        # # 6. 装甲板尺寸限制
+        # all_points = np.array([light_1.top, light_1.bottom, light_2.top, light_2.bottom])
+        # armor_width = np.max(all_points[:, 0]) - np.min(all_points[:, 0])
+        # armor_height = np.max(all_points[:, 1]) - np.min(all_points[:, 1])
         
-        # 宽度和高度限制
-        size_ok = (armor_width <= self.a_params.max_armor_width and 
-                armor_height <= self.a_params.max_armor_height)
+        # # 宽度和高度限制
+        # size_ok = (armor_width <= self.a_params.max_armor_width and 
+        #         armor_height <= self.a_params.max_armor_height)
         
-        if not size_ok:
-            return False
+        # if not size_ok:
+        #     return False
         
-        # 7. 长宽比限制(修复:允许接近正方形)
-        if armor_width > 0 and armor_height > 0:
-            armor_aspect_ratio = armor_width / armor_height
-            aspect_ratio_ok = 0.8 < armor_aspect_ratio < 5.0  # 从1.0改为0.8,允许接近正方形
-        else:
-            aspect_ratio_ok = False
+        # # 7. 长宽比限制(修复:允许接近正方形)
+        # if armor_width > 0 and armor_height > 0:
+        #     armor_aspect_ratio = armor_width / armor_height
+        #     aspect_ratio_ok = 0.8 < armor_aspect_ratio < 5.0  # 从1.0改为0.8,允许接近正方形
+        # else:
+        #     aspect_ratio_ok = False
         
-        return aspect_ratio_ok
+        return True
     
     def detect(self, gray_img):
         """检测装甲板"""
@@ -458,7 +458,7 @@ def create_dataset(image_dir, output_label_dir, output_image_dir, detector, clas
 
         classified_data = get_one_image_label(image_gray, detector, classifier)
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # 核心修改：先过滤数据，把 class_id == 6 的剔除
         # -------------------------------------------------
         valid_data = [item for item in classified_data if item['class_id'] != 6]
