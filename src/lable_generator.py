@@ -15,6 +15,7 @@ from typing import List, Tuple, Optional
 import json
 from tqdm import tqdm
 from matplotlib import pyplot as plt
+import shutil
 
 class Light:
     """灯条类"""
@@ -22,6 +23,7 @@ class Light:
         self.center = rotated_rect[0]
         self.size = rotated_rect[1]
         self.angle = rotated_rect[2]
+        self.color = None  # 预留颜色属性 蓝色:0 红色:1
         
         # 计算长宽
         if self.size[0] < self.size[1]:
@@ -72,12 +74,14 @@ class TraditionalArmorDetector:
         self.l_params = LightParams()
         self.a_params = ArmorParams()
     
-    def preprocess_image(self, gray_img):
+    def preprocess_image(self, bayer_raw):
         """图像预处理 - 二值化"""
+        gray_img = bayer_raw
+        bgr_img = cv2.cvtColor(bayer_raw, cv2.COLOR_BayerBG2BGR)
         _, binary = cv2.threshold(gray_img, self.binary_thresh, 255, cv2.THRESH_BINARY)
-        return binary
+        return binary, bgr_img
     
-    def find_lights(self, binary_img) -> List[Light]:
+    def find_lights(self, binary_img, bgr_img) -> List[Light]:
         """查找灯条"""
         contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
@@ -91,9 +95,44 @@ class TraditionalArmorDetector:
             
             if not self.is_light(light):
                 continue
+
+            # 计算灯条颜色 - 基于ROI区域内的R/B通道统计
+            sum_r, sum_g, sum_b = 0, 0, 0
+            pixel_count = 0
+            
+            # 获取轮廓的外接矩形
+            rect = cv2.boundingRect(contour)
+            x, y, w, h = rect
+            
+            # 提取ROI区域
+            roi = bgr_img[y:y+h, x:x+w]
+            
+            # 遍历ROI中的每个像素
+            for i in range(h):
+                for j in range(w):
+                    # 检查点是否在轮廓内（使用原图坐标系）
+                    point = (j + x, i + y)
+                    if cv2.pointPolygonTest(contour, point, False) >= 0:
+                        # 累加RGB值 (OpenCV格式是BGR)
+                        b, g, r = roi[i, j]
+                        sum_r += int(r)
+                        sum_g += int(g)
+                        sum_b += int(b)
+                        pixel_count += 1
+            
+            # 判断灯条颜色 (红色 vs 蓝色)
+            if pixel_count > 0:
+                avg_r = sum_r / pixel_count
+                avg_b = sum_b / pixel_count
+                # 如果红色分量更大，标记为红色灯条，否则为蓝色
+                light.color = 1 if avg_r > avg_b else 0
+            else:
+                light.color = -1
+
             lights.append(light)
         
         return lights
+
     
     def is_light(self, light: Light) -> bool:
         """判断是否为有效灯条"""
@@ -118,6 +157,9 @@ class TraditionalArmorDetector:
         
         for i, light_1 in enumerate(lights):
             for light_2 in lights[i+1:]:
+                if (light_1.color is not None and light_2.color is not None and
+                    light_1.color != light_2.color):
+                    continue
                 if self.is_armor(light_1, light_2):
                     armors.append((light_1, light_2))
         
@@ -188,11 +230,10 @@ class TraditionalArmorDetector:
         
         return True
     
-    def detect(self, gray_img):
+    def detect(self, img):
         """检测装甲板"""
-        
-        binary_img = self.preprocess_image(gray_img)
-        lights = self.find_lights(binary_img)
+        binary_img, bgr_img = self.preprocess_image(img)
+        lights = self.find_lights(binary_img, bgr_img)
         armors = self.match_lights(lights)
         
         return binary_img, armors, lights
@@ -431,7 +472,8 @@ def get_one_image_label(image, detector, classifier):
         classified_data.append({
             'class_id': class_id,
             'bbox': (x_center, y_center, bbox_width, bbox_height),
-            'keypoints': keypoints
+            'keypoints': keypoints,
+            'color' : light_1.color if light_1.color == light_2.color else -1
         })
 
     return classified_data
@@ -453,21 +495,24 @@ def create_dataset(image_dir, output_label_dir, output_image_dir, detector, clas
     image_files = list(image_dir.glob("*.bmp")) + list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png"))
 
     for image_file in tqdm(image_files, desc="Processing Dataset"):
-        image_gray = cv2.imread(str(image_file), cv2.IMREAD_GRAYSCALE)
-        if image_gray is None: continue
+        image_bayer = cv2.imread(str(image_file), cv2.IMREAD_GRAYSCALE)
+        if image_bayer is None: continue
 
-        classified_data = get_one_image_label(image_gray, detector, classifier)
+        classified_data = get_one_image_label(image_bayer, detector, classifier)
 
         # ---------------------------------------------
         # 核心修改：先过滤数据，把 class_id == 6 的剔除
         # -------------------------------------------------
         valid_data = [item for item in classified_data if item['class_id'] != 6]
 
-        # 3. 图像处理：转 3 通道 + Resize (始终执行，因为负样本图也是极好的训练素材)
-        image_3c = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
-        image_resized = cv2.resize(image_3c, (640, 640))
-        save_img_path = output_image_dir / (image_file.stem + ".jpg")
-        cv2.imwrite(str(save_img_path), image_resized)
+        # # 3. 图像处理：转 3 通道 + Resize (始终执行，因为负样本图也是极好的训练素材)
+        # image_3c = cv2.cvtColor(image_bayer, cv2.COLOR_BayerBG2BGR)
+        # save_img_path = output_image_dir / (image_file.stem + ".jpg")
+        # cv2.imwrite(str(save_img_path), image_3c)
+        save_raw_path = output_image_dir / image_file.name
+    
+        # 直接复制文件 (比 cv2.imwrite 快且安全)
+        shutil.copy2(str(image_file), str(save_raw_path))
 
         # 4. 保存标签文件
         # 即使 valid_data 为空（说明全是负样本），我们也建议创建一个空的 txt 文件
@@ -478,19 +523,18 @@ def create_dataset(image_dir, output_label_dir, output_image_dir, detector, clas
         if valid_data:
             for item in valid_data:
                 class_id = item['class_id']
-                bbox = item['bbox']
                 keypoints = item['keypoints']
+                color = item['color']
 
-                line_parts = [
-                    str(class_id),
-                    f"{bbox[0]:.6f}", f"{bbox[1]:.6f}", f"{bbox[2]:.6f}", f"{bbox[3]:.6f}"
-                ]
+                line_parts = []
                 for kp in keypoints:
                     line_parts.append(f"{kp[0]:.6f}")
                     line_parts.append(f"{kp[1]:.6f}")
-                    line_parts.append("2") # 可见性
                 
-                label_lines.append(" ".join(line_parts))
+                line_parts.append(str(class_id))
+                line_parts.append(str(color))
+
+                label_lines.append(" ".join(line_parts)+ "\n")
 
         # 写入文件 (如果是空列表，就创建一个空文件)
         with open(label_file_path, 'w') as f:
@@ -507,8 +551,8 @@ if __name__ == "__main__":
 
     create_dataset(
         image_dir=raw_image_dir,
-        output_label_dir="/home/wangfeng/RM2026/amor_data/python_refactor/dataset/train/labels",
-        output_image_dir="/home/wangfeng/RM2026/amor_data/python_refactor/dataset/train/images",
+        output_label_dir="/home/wangfeng/RM2026/amor_data/python_refactor/dataset/test",
+        output_image_dir="/home/wangfeng/RM2026/amor_data/python_refactor/dataset/test",
         detector=detector,
         classifier=classifier
     )

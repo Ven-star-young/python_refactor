@@ -63,9 +63,6 @@ def copy_dataset(source_dir, target_dir, move_files=False):
                     action_func = shutil.move if move_files else shutil.copy2
                     action_name = "移动" if move_files else "复制"
 
-                    # 1. 处理图片
-                    
-
                     # 2. 处理标签文件 (如果存在)
                     if found_data_file:
                         action_func(str(file_path), str(dst_path / file_path.name))
