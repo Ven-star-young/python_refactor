@@ -34,16 +34,19 @@ class Light:
             self.length = self.size[0]
             self.angle += 90
         
+        # 平均亮度（灰度图轮廓内均值）
+        self.average_brightness = 0.0
+
         # 计算顶点 - 使用box顶点取平均(修复:取对边中点)
         box = cv2.boxPoints(rotated_rect)  # 获取旋转矩形的4个顶点
         box = np.array(box)
-        
+
         # 按Y坐标排序,分为上下两组
         sorted_box = box[np.argsort(box[:, 1])]
-        
+
         # 上边两个顶点的中点
         self.top = tuple(((sorted_box[0] + sorted_box[1]) / 2).astype(float))
-        
+
         # 下边两个顶点的中点
         self.bottom = tuple(((sorted_box[2] + sorted_box[3]) / 2).astype(float))
 
@@ -75,13 +78,13 @@ class TraditionalArmorDetector:
         self.a_params = ArmorParams()
     
     def preprocess_image(self, bayer_raw):
-        """图像预处理 - 二值化"""
-        gray_img = bayer_raw
+        """图像预处理 - 二值化。从 Bayer 原图生成 BGR、灰度图和二值图"""
         bgr_img = cv2.cvtColor(bayer_raw, cv2.COLOR_BayerBG2BGR)
+        gray_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
         _, binary = cv2.threshold(gray_img, self.binary_thresh, 255, cv2.THRESH_BINARY)
-        return binary, bgr_img
+        return binary, bgr_img, gray_img
     
-    def find_lights(self, binary_img, bgr_img) -> List[Light]:
+    def find_lights(self, binary_img, bgr_img, gray_img=None) -> List[Light]:
         """查找灯条"""
         contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
@@ -129,8 +132,13 @@ class TraditionalArmorDetector:
             else:
                 light.color = -1
 
+            # 计算平均亮度（用于 expand_factor）
+            if gray_img is not None:
+                light.average_brightness = self._compute_light_average_brightness(
+                    contour, gray_img)
+
             lights.append(light)
-        
+
         return lights
 
     
@@ -150,7 +158,19 @@ class TraditionalArmorDetector:
         size_ok = light.length >= self.l_params.min_length and light.width >= self.l_params.min_width
         
         return ratio_ok and angle_ok and size_ok
-    
+
+    def _compute_light_average_brightness(self, contour, gray_img):
+        """灰度轮廓内的均值亮度，用于 expand_factor 计算"""
+        rect = cv2.boundingRect(contour)
+        x, y, w, h = rect
+        if x < 0 or y < 0 or x + w > gray_img.shape[1] or y + h > gray_img.shape[0]:
+            return 0.0
+        roi = gray_img[y:y + h, x:x + w]
+        shifted = contour - np.array([x, y])
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, shifted.astype(np.int32), 255)
+        return cv2.mean(roi, mask=mask)[0]
+
     def match_lights(self, lights: List[Light]) -> List[Tuple[Light, Light]]:
         """匹配灯条形成装甲板"""
         armors = []
@@ -232,11 +252,11 @@ class TraditionalArmorDetector:
     
     def detect(self, img):
         """检测装甲板"""
-        binary_img, bgr_img = self.preprocess_image(img)
-        lights = self.find_lights(binary_img, bgr_img)
+        binary_img, bgr_img, gray_img = self.preprocess_image(img)
+        lights = self.find_lights(binary_img, bgr_img, gray_img)
         armors = self.match_lights(lights)
-        
-        return binary_img, armors, lights
+
+        return binary_img, bgr_img, gray_img, armors, lights
     
 #==================================================================================
 # roi提取
@@ -329,6 +349,7 @@ def extract_number_rois(src_img, armors):
 
 import onnxruntime
 import json
+from light_corner_corrector import LightCornerCorrector
 
 class NumberClassifier:
     """
@@ -422,103 +443,182 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-def get_one_image_label(image, detector, classifier):
-    height, width = image.shape
 
-    binary_img, armors, lights = detector.detect(image)
-        
-    roi_images, armor_infos = extract_number_rois(image, armors)
+def _compute_expand_factor(this_brightness, other_brightness):
+    """计算 expand_factor，用于角点重提取的 ROI 扩张和 gamma 校正。
+
+    C++ 公式:
+        gamma = log2(this/255) / log2(other/255)
+        gamma = max(gamma, 1.0)
+        expand_factor = gamma^2
+    """
+    eps = 0.1
+    b_this = max(this_brightness, eps)
+    b_other = max(other_brightness, eps)
+    if b_this <= eps or b_other <= eps:
+        return 1.0
+    gamma = np.log2(b_this / 255.0) / np.log2(b_other / 255.0)
+    gamma = max(gamma, 1.0)
+    return gamma ** 2
+
+
+def get_one_image_label(image_bayer, detector, classifier,
+                        corrector=None, is_debug=False):
+    """对单张图像运行检测 + 分类 + 角点重提取，返回标注数据。
+
+    Args:
+        image_bayer:  原始 Bayer 灰度图
+        detector:     TraditionalArmorDetector
+        classifier:   NumberClassifier
+        corrector:    LightCornerCorrector (可选，None 则跳过重提取)
+
+    Returns:
+        (classified_data, variance_data)
+    """
+    height, width = image_bayer.shape
+
+    binary_img, bgr_img, gray_img, armors, lights = detector.detect(image_bayer)
+
+    roi_images, armor_infos = extract_number_rois(gray_img, armors)
 
     classified_armors = []
     for roi_img, armor_info in zip(roi_images, armor_infos):
         class_id, confidence = classifier.classify_single(roi_img)
         if confidence >= classifier.threshold:
             classified_armors.append((armor_info, class_id, confidence))
-    
+
+    # --- 组装分类输出 ---
     classified_data = []
-    for classified_armor in classified_armors:
-        armor_info, class_id, confidence = classified_armor
+    for armor_info, class_id, confidence in classified_armors:
         light_1 = armor_info['light_1']
         light_2 = armor_info['light_2']
 
-        # 计算归一化坐标 (0.0 ~ 1.0)
-        # 注意：这里保持原图的宽高进行归一化，这样直接 resize 图片后坐标依然有效
+        # 关键点使用重提取后的角点（若已运行）
         l1_top_norm = (light_1.top[0] / width, light_1.top[1] / height)
         l1_bot_norm = (light_1.bottom[0] / width, light_1.bottom[1] / height)
         l2_top_norm = (light_2.top[0] / width, light_2.top[1] / height)
         l2_bot_norm = (light_2.bottom[0] / width, light_2.bottom[1] / height)
 
-        # 关键点列表
         keypoints = [
             l1_top_norm,
             l1_bot_norm,
             l2_bot_norm,
-            l2_top_norm,  # 注意检查这里的顺序是否符合你定义的逻辑（左上、左下、右下、右上）
+            l2_top_norm,
         ]
 
-        # 计算 Bounding Box
         x_center = (light_1.center[0] + light_2.center[0]) / 2 / width
         y_center = (light_1.center[1] + light_2.center[1]) / 2 / height
-        # 适当扩大 bbox 范围，确保包含整个装甲板
-        bbox_width = abs(light_2.center[0] - light_1.center[0]) * 1.5 / width 
+        bbox_width = abs(light_2.center[0] - light_1.center[0]) * 1.5 / width
         bbox_height = (light_1.length + light_2.length) / 2 * 2.0 / height
-        
-        # 简单的越界处理 (防止 bbox 超出 0-1)
+
         x_center = max(0, min(1, x_center))
         y_center = max(0, min(1, y_center))
         bbox_width = max(0, min(1, bbox_width))
         bbox_height = max(0, min(1, bbox_height))
 
         classified_data.append({
+            'light_1': light_1,
+            'light_2': light_2,
             'class_id': class_id,
             'bbox': (x_center, y_center, bbox_width, bbox_height),
             'keypoints': keypoints,
-            'color' : light_1.color if light_1.color == light_2.color else -1
+            'color': light_1.color if light_1.color == light_2.color else -1
         })
+    variance_data = []
 
-    return classified_data
+    # --- 角点重提取 ---
+    if corrector is not None:
+        for data in classified_data:
+            light_1 = data['light_1']
+            light_2 = data['light_2']
+            class_id = data['class_id']
 
-def create_dataset(image_dir, output_label_dir, output_image_dir, detector, classifier):
+            if class_id == 6:  # negative 样本不进行重提取
+                continue
+            expand_1 = _compute_expand_factor(light_1.average_brightness,
+                                               light_2.average_brightness)
+            expand_2 = _compute_expand_factor(light_2.average_brightness,
+                                               light_1.average_brightness)
+
+            for light_idx, (light, expand) in enumerate(
+                [(light_1, expand_1), (light_2, expand_2)]):
+
+                result = corrector.correct_corners(
+                    light, gray_img, image_bayer, expand, is_debug)
+                (variance_roi, enhanced_roi, bayer_roi,
+                 axis, top_corner, bottom_corner) = result
+
+                if variance_roi is not None:
+                    variance_data.append({
+                        'armor_info': armor_info,
+                        'light_idx': light_idx,
+                        'expanded_bbox': corrector.extractor.expanded_bbox,
+                        'variance_map': variance_roi,
+                        'enhanced_map': enhanced_roi,
+                        'bayer_roi': bayer_roi,
+                        'axis': axis,
+                        'top_corner': top_corner,
+                        'bottom_corner': bottom_corner,
+                    })
+
+    return classified_data, variance_data
+
+def create_dataset(image_dir, output_label_dir, output_image_dir,
+                   detector, classifier, corrector=None, is_debug=False):
     """
-    处理图像：转3通道 -> Resize -> 保存
-    生成标签：检测 -> 归一化 -> 保存 txt
+    处理图像 -> 保存副本 -> 生成标签 + 方差图。
     """
     image_dir = Path(image_dir)
     output_label_dir = Path(output_label_dir)
     output_image_dir = Path(output_image_dir)
-    
-    # 确保输出目录存在
+
     output_label_dir.mkdir(parents=True, exist_ok=True)
     output_image_dir.mkdir(parents=True, exist_ok=True)
 
-    # 支持多种图片格式
-    image_files = list(image_dir.glob("*.bmp")) + list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png"))
+    # 方差图输出目录
+    variance_dir = output_image_dir / "variance_maps"
+    variance_dir.mkdir(parents=True, exist_ok=True)
+
+    image_files = (list(image_dir.glob("*.bmp")) +
+                   list(image_dir.glob("*.jpg")) +
+                   list(image_dir.glob("*.png")))
 
     for image_file in tqdm(image_files, desc="Processing Dataset"):
         image_bayer = cv2.imread(str(image_file), cv2.IMREAD_GRAYSCALE)
-        if image_bayer is None: continue
+        if image_bayer is None:
+            continue
 
-        classified_data = get_one_image_label(image_bayer, detector, classifier)
+        classified_data, variance_data = get_one_image_label(
+            image_bayer, detector, classifier, corrector, is_debug)
 
-        # ---------------------------------------------
-        # 核心修改：先过滤数据，把 class_id == 6 的剔除
-        # -------------------------------------------------
+        # 过滤 class_id == 6（negative）
         valid_data = [item for item in classified_data if item['class_id'] != 6]
 
-        # # 3. 图像处理：转 3 通道 + Resize (始终执行，因为负样本图也是极好的训练素材)
-        # image_3c = cv2.cvtColor(image_bayer, cv2.COLOR_BayerBG2BGR)
-        # save_img_path = output_image_dir / (image_file.stem + ".jpg")
-        # cv2.imwrite(str(save_img_path), image_3c)
+        # 保存原始 Bayer 图像副本
         save_raw_path = output_image_dir / image_file.name
-    
-        # 直接复制文件 (比 cv2.imwrite 快且安全)
         shutil.copy2(str(image_file), str(save_raw_path))
 
-        # 4. 保存标签文件
-        # 即使 valid_data 为空（说明全是负样本），我们也建议创建一个空的 txt 文件
-        # 这样 YOLO 知道这张图是故意留空的，而不是数据丢失
+        # 保存方差图 + 元数据
+        for vdata in variance_data:
+            var_map_u8 = vdata['variance_map'].astype(np.uint8)
+            var_fname = f"{image_file.stem}_light{vdata['light_idx']}_variance.png"
+            cv2.imwrite(str(variance_dir / var_fname), var_map_u8)
+
+            meta = {
+                'expanded_bbox': list(vdata['expanded_bbox']),
+                'top_corner': (list(vdata['top_corner'])
+                               if vdata['top_corner'] is not None else None),
+                'bottom_corner': (list(vdata['bottom_corner'])
+                                  if vdata['bottom_corner'] is not None else None),
+                'axis_centroid': list(vdata['axis'].centroid),
+                'axis_direction': list(vdata['axis'].direction),
+            }
+            meta_fname = f"{image_file.stem}_light{vdata['light_idx']}_meta.json"
+            with open(variance_dir / meta_fname, 'w') as f:
+                json.dump(meta, f, indent=2)
+
+        # 保存标签文件
         label_file_path = output_label_dir / (image_file.stem + ".txt")
-        
         label_lines = []
         if valid_data:
             for item in valid_data:
@@ -530,29 +630,31 @@ def create_dataset(image_dir, output_label_dir, output_image_dir, detector, clas
                 for kp in keypoints:
                     line_parts.append(f"{kp[0]:.6f}")
                     line_parts.append(f"{kp[1]:.6f}")
-                
+
                 line_parts.append(str(class_id))
                 line_parts.append(str(color))
 
-                label_lines.append(" ".join(line_parts)+ "\n")
+                label_lines.append(" ".join(line_parts) + "\n")
 
-        # 写入文件 (如果是空列表，就创建一个空文件)
         with open(label_file_path, 'w') as f:
             f.write("\n".join(label_lines))
 
 
 if __name__ == "__main__":
-    model_path = "/home/wangfeng/RM2026/amor_data/python_refactor/model/cnn.onnx"
-    label_path = "/home/wangfeng/RM2026/amor_data/python_refactor/model/label.txt"
-    raw_image_dir = "/home/wangfeng/RM2026/amor_data/competation/5-24/3/images_0524_1608/"
+    model_path = "/home/frank/RM2026/python_refactor/model/cnn.onnx"
+    label_path = "/home/frank/RM2026/python_refactor/model/label.txt"
+    raw_image_dir = "/home/frank/RM2026/python_refactor/dataset/competation/5-25/3/images_0525_1023/"
 
     detector = TraditionalArmorDetector(binary_thresh=100)
     classifier = NumberClassifier(model_path, label_path)
+    corrector = LightCornerCorrector()
 
     create_dataset(
         image_dir=raw_image_dir,
-        output_label_dir="/home/wangfeng/RM2026/amor_data/python_refactor/dataset/test",
-        output_image_dir="/home/wangfeng/RM2026/amor_data/python_refactor/dataset/test",
+        output_label_dir="/home/frank/RM2026/python_refactor/dataset/test",
+        output_image_dir="/home/frank/RM2026/python_refactor/dataset/test",
         detector=detector,
-        classifier=classifier
+        classifier=classifier,
+        corrector=corrector,
+        is_debug=True
     )
