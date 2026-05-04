@@ -23,8 +23,9 @@ from lable_generator import (TraditionalArmorDetector, NumberClassifier,
                              extract_number_rois, _compute_expand_factor)
 
 
-def _save_labelme_json(save_dir, base_name, image_name, top_px, bot_px, h, w):
-    """保存 LabelMe 格式的 JSON 标注文件。"""
+def _save_labelme_json(save_dir, base_name, image_name, top_px, bot_px,
+                       axis_p1_px, axis_p2_px, h, w):
+    """保存 LabelMe 格式的 JSON 标注文件，含角点和主轴线段。"""
     data = {
         "version": "6.1.3",
         "flags": {},
@@ -44,6 +45,18 @@ def _save_labelme_json(save_dir, base_name, image_name, top_px, bot_px, h, w):
                 "group_id": None,
                 "description": "",
                 "shape_type": "point",
+                "flags": {},
+                "mask": None
+            },
+            {
+                "label": "axis",
+                "points": [
+                    [float(axis_p1_px[0]), float(axis_p1_px[1])],
+                    [float(axis_p2_px[0]), float(axis_p2_px[1])]
+                ],
+                "group_id": None,
+                "description": "symmetry axis line",
+                "shape_type": "line",
                 "flags": {},
                 "mask": None
             }
@@ -153,6 +166,15 @@ def extract_all(dataset_dir, out_dir, model_path, label_path):
                 def _norm(pt):
                     return ((pt[0] - tl_x) / roi_w, (pt[1] - tl_y) / roi_h)
 
+                # 主轴线段: 从形心沿主轴方向双向延伸，覆盖整个灯条
+                half_len = light.length / 2.0 * 1.2
+                dx, dy = axis.direction
+                cx, cy = axis.centroid  # 已是 ROI-local 坐标
+                axis_p1_roi = (cx - half_len * dx, cy - half_len * dy)
+                axis_p2_roi = (cx + half_len * dx, cy + half_len * dy)
+                axis_p1_norm = (axis_p1_roi[0] / roi_w, axis_p1_roi[1] / roi_h)
+                axis_p2_norm = (axis_p2_roi[0] / roi_w, axis_p2_roi[1] / roi_h)
+
                 with open(os.path.join(lbl_dir, f"{base}.txt"), 'w') as f:
                     if top_c is not None and bot_c is not None:
                         tn = _norm(top_c)
@@ -160,16 +182,19 @@ def extract_all(dataset_dir, out_dir, model_path, label_path):
                         f.write(f"{tn[0]:.6f} {tn[1]:.6f} {bn[0]:.6f} {bn[1]:.6f}\n")
                     else:
                         f.write("\n")
+                    f.write(f"{axis_p1_norm[0]:.6f} {axis_p1_norm[1]:.6f} "
+                            f"{axis_p2_norm[0]:.6f} {axis_p2_norm[1]:.6f}\n")
 
                 # LabelMe JSON: 像素坐标 (在 ROI 内)
-                if top_c is not None and bot_c is not None:
-                    top_px = (top_c[0] - tl_x, top_c[1] - tl_y)
-                    bot_px = (bot_c[0] - tl_x, bot_c[1] - tl_y)
-                    png_name = f"{base}.png"
-                    _save_labelme_json(gray_dir, base, png_name,
-                                       top_px, bot_px, roi_h, roi_w)
-                    _save_labelme_json(var_dir, base, png_name,
-                                       top_px, bot_px, roi_h, roi_w)
+                png_name = f"{base}.png"
+                top_px = (top_c[0] - tl_x, top_c[1] - tl_y) if top_c is not None else (0, 0)
+                bot_px = (bot_c[0] - tl_x, bot_c[1] - tl_y) if bot_c is not None else (0, 0)
+                _save_labelme_json(gray_dir, base, png_name,
+                                   top_px, bot_px, axis_p1_roi, axis_p2_roi,
+                                   roi_h, roi_w)
+                _save_labelme_json(var_dir, base, png_name,
+                                   top_px, bot_px, axis_p1_roi, axis_p2_roi,
+                                   roi_h, roi_w)
 
                 total += 1
 
